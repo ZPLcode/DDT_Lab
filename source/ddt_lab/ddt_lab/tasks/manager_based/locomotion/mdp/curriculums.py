@@ -59,47 +59,118 @@ def diagonal_spin_yaw_speed_levels(
     env: RLTaskEnv,
     env_ids: Sequence[int],
     reward_term_name: str,
+    lift_reward_term_name: str,
+    support_reward_term_name: str,
     command_name: str = "base_velocity",
-    levels: Sequence[float] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    levels: Sequence[float] = (0.5, 1.0, 1.5, 2.0, 2.0),
+    lift_activation_level: int = 4,
+    lift_success_thresholds: Sequence[float] = (0.0, 0.0, 0.0, 0.0, 0.2),
+    support_success_threshold: float = 0.9,
+    support_body_count: int = 2,
+    illegal_contact_term_name: str = "illegal_contact",
     tracking_threshold: float = 0.7,
     required_success_rate: float = 0.6,
     evaluation_episodes: int = 4096,
 ) -> dict[str, float]:
-    """Raise the fixed yaw command after stable tracking at the current level.
+    """Advance spin stages only after their required behavior is stable.
 
-    A completed episode is successful when its time-normalized yaw-tracking
-    reward reaches ``tracking_threshold`` of the term's maximum. Early
-    termination therefore counts against progression. After advancing, one
-    episode duration is left as a cooldown so every environment can receive
-    the new command before the next level is evaluated.
+    Before ``lift_activation_level``, success requires yaw tracking only. At
+    and after that level it additionally requires the requested air pair,
+    both support contacts, and no illegal-contact termination. Early
+    termination naturally reduces the time-normalized reward scores. After an
+    advance, one episode duration is left as a cooldown so every environment
+    can receive the new stage before the next evaluation window begins.
     """
     if not levels:
         raise ValueError("Yaw-speed curriculum requires at least one level.")
+    if not 0 <= lift_activation_level < len(levels):
+        raise ValueError("lift_activation_level must index the levels sequence.")
+    if len(lift_success_thresholds) != len(levels):
+        raise ValueError("lift_success_thresholds must have one value per level.")
+    if any(not 0.0 <= value <= 1.0 for value in lift_success_thresholds):
+        raise ValueError("Lift success thresholds must be in [0, 1].")
+    if not 0.0 <= support_success_threshold <= 1.0:
+        raise ValueError("support_success_threshold must be in [0, 1].")
+    if support_body_count <= 0:
+        raise ValueError("support_body_count must be positive.")
+    if not 0.0 <= tracking_threshold <= 1.0:
+        raise ValueError("tracking_threshold must be in [0, 1].")
+    if not 0.0 <= required_success_rate <= 1.0:
+        raise ValueError("required_success_rate must be in [0, 1].")
+    if evaluation_episodes <= 0:
+        raise ValueError("evaluation_episodes must be positive.")
 
     command_cfg = env.command_manager.get_term(command_name).cfg
 
     if not hasattr(env, "_diagonal_spin_curriculum_level"):
         env._diagonal_spin_curriculum_level = 0
         env._diagonal_spin_curriculum_successes = 0
+        env._diagonal_spin_tracking_successes = 0
+        env._diagonal_spin_lift_successes = 0
+        env._diagonal_spin_support_successes = 0
+        env._diagonal_spin_clean_episodes = 0
         env._diagonal_spin_curriculum_episodes = 0
         env._diagonal_spin_curriculum_success_rate = 0.0
+        env._diagonal_spin_tracking_success_rate = 0.0
+        env._diagonal_spin_lift_success_rate = 0.0
+        env._diagonal_spin_support_success_rate = 0.0
+        env._diagonal_spin_clean_rate = 0.0
         env._diagonal_spin_curriculum_level_step = env.common_step_counter
     elif env.common_step_counter - env._diagonal_spin_curriculum_level_step >= env.max_episode_length:
-        episode_sums = env.reward_manager._episode_sums[reward_term_name][env_ids]
-        reward_weight = env.reward_manager.get_term_cfg(reward_term_name).weight
-        normalized_tracking = episode_sums / (env.max_episode_length_s * reward_weight)
+        tracking_weight = env.reward_manager.get_term_cfg(reward_term_name).weight
+        lift_weight = env.reward_manager.get_term_cfg(lift_reward_term_name).weight
+        support_weight = env.reward_manager.get_term_cfg(support_reward_term_name).weight
+        if tracking_weight <= 0.0 or lift_weight <= 0.0 or support_weight <= 0.0:
+            raise ValueError("Curriculum reward terms must have positive weights.")
 
-        env._diagonal_spin_curriculum_successes += int(
-            torch.count_nonzero(normalized_tracking >= tracking_threshold).item()
+        tracking_score = env.reward_manager._episode_sums[reward_term_name][env_ids] / (
+            env.max_episode_length_s * tracking_weight
         )
-        env._diagonal_spin_curriculum_episodes += int(normalized_tracking.numel())
+        lift_score = env.reward_manager._episode_sums[lift_reward_term_name][env_ids] / (
+            env.max_episode_length_s * lift_weight
+        )
+        support_score = env.reward_manager._episode_sums[support_reward_term_name][env_ids] / (
+            env.max_episode_length_s * support_weight * support_body_count
+        )
+
+        level = env._diagonal_spin_curriculum_level
+        tracking_ok = tracking_score >= tracking_threshold
+        if level >= lift_activation_level:
+            lift_ok = lift_score >= lift_success_thresholds[level]
+            support_ok = support_score >= support_success_threshold
+            clean = ~env.termination_manager.get_term(illegal_contact_term_name)[env_ids]
+        else:
+            lift_ok = torch.ones_like(tracking_ok)
+            support_ok = torch.ones_like(tracking_ok)
+            clean = torch.ones_like(tracking_ok)
+
+        successes = tracking_ok & lift_ok & support_ok & clean
+        env._diagonal_spin_curriculum_successes += int(torch.count_nonzero(successes).item())
+        env._diagonal_spin_tracking_successes += int(torch.count_nonzero(tracking_ok).item())
+        env._diagonal_spin_lift_successes += int(torch.count_nonzero(lift_ok).item())
+        env._diagonal_spin_support_successes += int(torch.count_nonzero(support_ok).item())
+        env._diagonal_spin_clean_episodes += int(torch.count_nonzero(clean).item())
+        env._diagonal_spin_curriculum_episodes += int(tracking_score.numel())
 
         if env._diagonal_spin_curriculum_episodes >= evaluation_episodes:
+            num_episodes = env._diagonal_spin_curriculum_episodes
             success_rate = (
                 env._diagonal_spin_curriculum_successes
-                / env._diagonal_spin_curriculum_episodes
+                / num_episodes
             )
             env._diagonal_spin_curriculum_success_rate = success_rate
+            env._diagonal_spin_tracking_success_rate = (
+                env._diagonal_spin_tracking_successes / num_episodes
+            )
+            env._diagonal_spin_lift_success_rate = (
+                env._diagonal_spin_lift_successes / num_episodes
+            )
+            env._diagonal_spin_support_success_rate = (
+                env._diagonal_spin_support_successes / num_episodes
+            )
+            env._diagonal_spin_clean_rate = (
+                env._diagonal_spin_clean_episodes / num_episodes
+            )
             if (
                 success_rate >= required_success_rate
                 and env._diagonal_spin_curriculum_level < len(levels) - 1
@@ -108,12 +179,22 @@ def diagonal_spin_yaw_speed_levels(
                 env._diagonal_spin_curriculum_level_step = env.common_step_counter
 
             env._diagonal_spin_curriculum_successes = 0
+            env._diagonal_spin_tracking_successes = 0
+            env._diagonal_spin_lift_successes = 0
+            env._diagonal_spin_support_successes = 0
+            env._diagonal_spin_clean_episodes = 0
             env._diagonal_spin_curriculum_episodes = 0
 
-    yaw_command = float(levels[env._diagonal_spin_curriculum_level])
+    level = env._diagonal_spin_curriculum_level
+    yaw_command = float(levels[level])
     command_cfg.ranges.ang_vel_z = (yaw_command, yaw_command)
     return {
-        "level": float(env._diagonal_spin_curriculum_level),
+        "level": float(level),
         "yaw_command": yaw_command,
         "success_rate": float(env._diagonal_spin_curriculum_success_rate),
+        "tracking_success_rate": float(env._diagonal_spin_tracking_success_rate),
+        "lift_success_rate": float(env._diagonal_spin_lift_success_rate),
+        "support_success_rate": float(env._diagonal_spin_support_success_rate),
+        "clean_rate": float(env._diagonal_spin_clean_rate),
+        "lift_threshold": float(lift_success_thresholds[level]),
     }

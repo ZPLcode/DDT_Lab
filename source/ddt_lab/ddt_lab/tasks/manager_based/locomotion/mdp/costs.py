@@ -15,6 +15,7 @@ Translated from ``LocomotionWithNP3O/configs/base/legged_robot.py`` (the
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,3 +80,37 @@ def hip_pos_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCf
     q = asset.data.joint_pos[:, asset_cfg.joint_ids]
     q_default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
     return torch.sum(torch.square(q - q_default), dim=1)
+
+
+def body_tilt_limit(
+    env: ManagerBasedRLEnv,
+    initial_limit_rad: float,
+    final_limit_rad: float,
+    start_step: int,
+    end_step: int,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize only body tilt beyond a gradually tightening limit.
+
+    The limit stays at ``initial_limit_rad`` through ``start_step``, changes
+    linearly to ``final_limit_rad`` by ``end_step``, and remains there.  Using
+    a dead zone lets the policy explore tilted diagonal-support postures while
+    NP3O treats excessive tilt as a constraint instead of a task reward.
+    """
+    if start_step < 0:
+        raise ValueError("Body-tilt cost start_step must be non-negative.")
+    if end_step <= start_step:
+        raise ValueError("Body-tilt cost end_step must be greater than start_step.")
+    if not 0.0 <= final_limit_rad <= initial_limit_rad < math.pi:
+        raise ValueError(
+            "Body-tilt limits must satisfy 0 <= final <= initial < pi."
+        )
+
+    progress = (env.common_step_counter - start_step) / (end_step - start_step)
+    progress = min(max(float(progress), 0.0), 1.0)
+    tilt_limit = initial_limit_rad + progress * (final_limit_rad - initial_limit_rad)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    upright_cosine = (-asset.data.projected_gravity_b[:, 2]).clamp(-1.0, 1.0)
+    tilt_angle = torch.acos(upright_cosine)
+    return torch.square((tilt_angle - tilt_limit).clamp_min(0.0))

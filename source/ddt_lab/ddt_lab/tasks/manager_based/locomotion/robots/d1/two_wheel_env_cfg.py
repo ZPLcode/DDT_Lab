@@ -13,6 +13,7 @@ The objective is fixed, so no gait-mode one-hot is needed.
 import math
 
 import ddt_lab.tasks.manager_based.locomotion.mdp as mdp
+from ddt_lab.managers import CostTermCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import SceneEntityCfg
@@ -36,29 +37,32 @@ class D1DiagonalSpinRewardsCfg:
     # Keep the body level while FR/RL are lifted and FL/RR support the robot.
     orientation = RewTerm(
         func=mdp.projected_gravity_target_l2,
-        weight=-20.0,
+        # Smoothly favor a level chassis. Excessive tilt is also handled as
+        # an NP3O cost with a gradually tightening tolerance below.
+        weight=-5.0,
         params={"target_gravity": TARGET_GRAVITY},
     )
     base_height = RewTerm(
         func=mdp.base_height_l2,
-        weight=-5.0,
-        params={"target_height": 0.35},
+        weight=-20.0,
+        params={"target_height": 0.40},
     )
     air_wheel_height = RewTerm(
-        func=mdp.selected_body_height_exp_at_min_ang_vel_z,
+        func=mdp.selected_body_height_exp_in_diagonal_lift_phase,
         weight=10.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=AIR_WHEELS),
-            # D1 wheel radius is 0.087 m, so a 0.18 m wheel-center target
-            # leaves about 9.3 cm of ground clearance without over-folding.
+            # D1 wheel radius is 0.087 m.  A 0.18 m wheel-center target gives
+            # about 9.3 cm of visible clearance, matching the tucked pose.
             "target_height": 0.18,
             "std": 0.08,
-            "min_ang_vel_z": 2.0,
-            "transition_width": 0.10,
+            "activation_level": 4,
+            "grace_period_s": 2.0,
+            "transition_width_s": 1.0,
         },
     )
     air_wheels_both_air = RewTerm(
-        func=mdp.selected_bodies_air_with_support_at_min_ang_vel_z,
+        func=mdp.selected_bodies_air_with_support_in_diagonal_lift_phase,
         weight=5.0,
         params={
             "air_sensor_cfg": SceneEntityCfg(
@@ -67,8 +71,9 @@ class D1DiagonalSpinRewardsCfg:
             "support_sensor_cfg": SceneEntityCfg(
                 "contact_forces", body_names=SUPPORT_WHEELS
             ),
-            "min_ang_vel_z": 2.0,
-            "transition_width": 0.10,
+            "activation_level": 4,
+            "grace_period_s": 2.0,
+            "transition_width_s": 1.0,
             "min_air_time": 0.02,
             "contact_threshold": 1.0,
         },
@@ -78,7 +83,7 @@ class D1DiagonalSpinRewardsCfg:
     # reset so the policy first builds speed on all four wheels.
     track_lin_vel_xy = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp_at_gravity_target,
-        weight=1.0,
+        weight=2.0,
         params={
             "command_name": "base_velocity",
             "std": math.sqrt(0.25),
@@ -88,7 +93,7 @@ class D1DiagonalSpinRewardsCfg:
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
-        weight=5.0,
+        weight=10.0,
         params={
             "command_name": "base_velocity",
             # The curriculum keeps adjacent targets close enough for this
@@ -106,18 +111,21 @@ class D1DiagonalSpinRewardsCfg:
             "threshold": 1.0,
         },
     )
-    # FR/RL contacts are rewarded while speed is low, then smoothly become a
-    # penalty. This explicitly teaches four-wheel acceleration before lift-off.
+    # FR/RL contacts are rewarded through the four-wheel curriculum. From
+    # level 4 onward, each episode gets 2 s to spin up before this reward fades
+    # to zero. Height and air-time rewards then teach lift without a large
+    # contact-penalty cliff.
     air_wheel_contacts = RewTerm(
-        func=mdp.selected_body_contact_count_by_ang_vel_z_phase,
+        func=mdp.selected_body_contact_count_by_diagonal_lift_phase,
         weight=2.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=AIR_WHEELS),
             "threshold": 1.0,
-            "min_ang_vel_z": 2.0,
-            "transition_width": 0.10,
-            "low_speed_scale": 1.0,
-            "high_speed_scale": -2.0,
+            "activation_level": 4,
+            "grace_period_s": 2.0,
+            "transition_width_s": 1.0,
+            "spinup_scale": 1.0,
+            "lift_scale": 0.0,
         },
     )
 
@@ -158,17 +166,15 @@ class D1DiagonalSpinRewardsCfg:
             "threshold": 1.0,
         },
     )
-
-
 @configclass
 class D1DiagonalSpinTerminationsCfg(TerminationsCfg):
-    """Terminate when a non-wheel body hits the ground."""
+    """Terminate only when the chassis hits the ground."""
 
     illegal_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
             "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=["^(?!.*_foot).*"]
+                "contact_forces", body_names=[".*base_link"]
             ),
             "threshold": 1.0,
         },
@@ -177,16 +183,53 @@ class D1DiagonalSpinTerminationsCfg(TerminationsCfg):
 
 @configclass
 class D1DiagonalSpinCurriculumCfg(CurriculumCfg):
-    """Learn stable four-wheel yaw tracking before increasing spin speed."""
+    """Learn four-wheel spin, then hold at 2 rad/s to learn diagonal lift."""
 
     yaw_speed_levels = CurrTerm(
         func=mdp.diagonal_spin_yaw_speed_levels,
         params={
             "reward_term_name": "track_ang_vel_z",
-            "levels": (0.5, 1.0, 1.5, 2.0, 2.0, 2.0, 2.5, 3.0),
+            "lift_reward_term_name": "air_wheels_both_air",
+            "support_reward_term_name": "support_wheel_contacts",
+            "levels": (0.5, 1.0, 1.5, 2.0, 2.0),
+            "lift_activation_level": 4,
+            "lift_success_thresholds": (0.0, 0.0, 0.0, 0.0, 0.20),
+            "support_success_threshold": 0.90,
+            "support_body_count": len(SUPPORT_WHEELS),
+            "illegal_contact_term_name": "illegal_contact",
             "tracking_threshold": 0.7,
             "required_success_rate": 0.6,
             "evaluation_episodes": 4096,
+        },
+    )
+
+
+@configclass
+class D1DiagonalSpinCostsCfg(CostsCfg):
+    """Safety constraints for diagonal-spin training."""
+
+    hip_posture = CostTermCfg(
+        func=mdp.hip_pos_l2,
+        scale=1.0,
+        d_value=0.0,
+        k_value=0.01,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_joint"])},
+    )
+
+    body_tilt_limit = CostTermCfg(
+        func=mdp.body_tilt_limit,
+        scale=1.0,
+        d_value=0.0,
+        k_value=0.01,
+        params={
+            # NP3O collects 24 environment steps per learning iteration:
+            # allow 10 degrees initially, then linearly tighten the dead zone
+            # to 5 degrees by iteration 3k.
+            "initial_limit_rad": math.radians(10.0),
+            "final_limit_rad": math.radians(5.0),
+            "start_step": 0,
+            "end_step": 72_000,
+            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 
@@ -198,7 +241,7 @@ class D1DiagonalSpinFlatEnvCfg(D1FlatEnvCfg):
     rewards: D1DiagonalSpinRewardsCfg = D1DiagonalSpinRewardsCfg()
     terminations: D1DiagonalSpinTerminationsCfg = D1DiagonalSpinTerminationsCfg()
     curriculum: D1DiagonalSpinCurriculumCfg = D1DiagonalSpinCurriculumCfg()
-    costs: CostsCfg = CostsCfg()
+    costs: D1DiagonalSpinCostsCfg = D1DiagonalSpinCostsCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -273,6 +316,7 @@ class D1DiagonalSpinFlatEnvCfg_PLAY(D1DiagonalSpinFlatEnvCfg):
         self.events.physics_material = None
         # Evaluate the final target directly; curriculum is training-only.
         self.curriculum.yaw_speed_levels = None
+        self.commands.base_velocity.ranges.ang_vel_z = (2.0, 2.0)
         # Playback also starts from the normal four-wheel stance.
         self.events.reset_base.params["pose_range"]["pitch"] = (-0.05, 0.05)
         self.events.reset_base.params["pose_range"]["z"] = (-0.16, -0.13)

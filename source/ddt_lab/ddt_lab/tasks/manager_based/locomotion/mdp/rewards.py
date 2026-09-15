@@ -810,44 +810,69 @@ def selected_body_height_exp(
     return torch.exp(-height_error / std**2)
 
 
-def _min_ang_vel_z_gate(
+def _diagonal_spin_lift_phase_gate(
     env: ManagerBasedRLEnv,
-    min_ang_vel_z: float,
-    transition_width: float,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    activation_level: int,
+    grace_period_s: float,
+    transition_width_s: float,
 ) -> torch.Tensor:
-    """Smoothly activate a term once the absolute world yaw rate is high enough."""
-    asset: RigidObject = env.scene[asset_cfg.name]
-    return torch.sigmoid(
-        (torch.abs(asset.data.root_ang_vel_w[:, 2]) - min_ang_vel_z) / transition_width
-    )
+    """Activate the lift phase from a curriculum level, after reset grace.
+
+    Unlike an actual-yaw-rate gate, this phase cannot be disabled by slowing
+    down.  Training levels below ``activation_level`` stay in four-wheel mode.
+    Once that level is reached, every episode gets ``grace_period_s`` to spin
+    up on four wheels, followed by the lift phase for the rest of the episode.
+    """
+    if activation_level < 0:
+        raise ValueError("Lift-phase activation_level must be non-negative.")
+    if grace_period_s < 0.0:
+        raise ValueError("Lift-phase grace_period_s must be non-negative.")
+    if transition_width_s <= 0.0:
+        raise ValueError("Lift-phase transition_width_s must be positive.")
+
+    curriculum_level = getattr(env, "_diagonal_spin_curriculum_level", None)
+    if curriculum_level is None:
+        # The PLAY config disables the speed curriculum and evaluates the
+        # final task directly, so it should still enter the lift phase.
+        curriculum_cfg = getattr(env.cfg, "curriculum", None)
+        curriculum_is_active = (
+            curriculum_cfg is not None
+            and getattr(curriculum_cfg, "yaw_speed_levels", None) is not None
+        )
+        curriculum_level = 0 if curriculum_is_active else activation_level
+
+    elapsed_s = env.episode_length_buf.float() * env.step_dt
+    if curriculum_level < activation_level:
+        return torch.zeros_like(elapsed_s)
+    return ((elapsed_s - grace_period_s) / transition_width_s).clamp(0.0, 1.0)
 
 
-def selected_body_height_exp_at_min_ang_vel_z(
+def selected_body_height_exp_in_diagonal_lift_phase(
     env: ManagerBasedRLEnv,
     target_height: float,
     std: float,
-    min_ang_vel_z: float,
-    transition_width: float,
+    activation_level: int,
+    grace_period_s: float,
+    transition_width_s: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward selected-body height only after the robot has built yaw speed."""
-    return selected_body_height_exp(env, target_height, std, asset_cfg) * _min_ang_vel_z_gate(
-        env, min_ang_vel_z, transition_width
+    """Reward selected-body height during the curriculum lift phase."""
+    return selected_body_height_exp(env, target_height, std, asset_cfg) * _diagonal_spin_lift_phase_gate(
+        env, activation_level, grace_period_s, transition_width_s
     )
 
 
-def selected_bodies_air_with_support_at_min_ang_vel_z(
+def selected_bodies_air_with_support_in_diagonal_lift_phase(
     env: ManagerBasedRLEnv,
     air_sensor_cfg: SceneEntityCfg,
     support_sensor_cfg: SceneEntityCfg,
-    min_ang_vel_z: float,
-    transition_width: float,
+    activation_level: int,
+    grace_period_s: float,
+    transition_width_s: float,
     min_air_time: float = 0.02,
     contact_threshold: float = 1.0,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Continuously reward the requested air pair while both supports touch."""
+    """Reward the requested air pair and supports during the lift phase."""
     air_sensor: ContactSensor = env.scene.sensors[air_sensor_cfg.name]
     support_sensor: ContactSensor = env.scene.sensors[support_sensor_cfg.name]
 
@@ -863,24 +888,26 @@ def selected_bodies_air_with_support_at_min_ang_vel_z(
     )
     all_support = torch.all(support_contacts, dim=1)
 
-    return (all_air & all_support).float() * _min_ang_vel_z_gate(
-        env, min_ang_vel_z, transition_width, asset_cfg
+    return (all_air & all_support).float() * _diagonal_spin_lift_phase_gate(
+        env, activation_level, grace_period_s, transition_width_s
     )
 
 
-def selected_body_contact_count_by_ang_vel_z_phase(
+def selected_body_contact_count_by_diagonal_lift_phase(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
-    min_ang_vel_z: float,
-    transition_width: float,
+    activation_level: int,
+    grace_period_s: float,
+    transition_width_s: float,
     threshold: float = 1.0,
-    low_speed_scale: float = 1.0,
-    high_speed_scale: float = -2.0,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    spinup_scale: float = 1.0,
+    lift_scale: float = -2.0,
 ) -> torch.Tensor:
-    """Reward selected contacts at low yaw speed and penalize them at high speed."""
-    gate = _min_ang_vel_z_gate(env, min_ang_vel_z, transition_width, asset_cfg)
-    scale = low_speed_scale * (1.0 - gate) + high_speed_scale * gate
+    """Reward selected contacts during spin-up, then penalize them."""
+    gate = _diagonal_spin_lift_phase_gate(
+        env, activation_level, grace_period_s, transition_width_s
+    )
+    scale = spinup_scale * (1.0 - gate) + lift_scale * gate
     return selected_body_contact_count(env, sensor_cfg, threshold) * scale
 
 

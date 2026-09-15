@@ -48,6 +48,33 @@ def _resolve_runner_cfg(entry_point: str) -> dict:
     return cfg
 
 
+def _load_for_play(runner: OnConstraintPolicyRunner, checkpoint_path: str) -> None:
+    """Load an inference checkpoint while tolerating cost-head-only changes."""
+    checkpoint = torch.load(checkpoint_path, map_location=runner.device)
+    checkpoint_state = checkpoint['model_state_dict']
+    current_state = runner.alg.actor_critic.state_dict()
+
+    compatible_state = {
+        key: value
+        for key, value in checkpoint_state.items()
+        if key in current_state and current_state[key].shape == value.shape
+    }
+    incompatible_keys = (set(checkpoint_state) | set(current_state)) - set(compatible_state)
+    non_cost_keys = sorted(key for key in incompatible_keys if not key.startswith('cost.'))
+    if non_cost_keys:
+        raise RuntimeError(
+            'Checkpoint is incompatible with the current policy architecture: '
+            + ', '.join(non_cost_keys)
+        )
+
+    runner.alg.actor_critic.load_state_dict(compatible_state, strict=False)
+    if incompatible_keys:
+        print(
+            '[WARNING] Cost critic shape changed; loaded the complete actor for '
+            'inference and skipped its incompatible cost head.'
+        )
+
+
 def main():
     spec = gym.spec(args_cli.task)
     runner_cfg = _resolve_runner_cfg(spec.kwargs['np3o_cfg_entry_point'])
@@ -67,7 +94,7 @@ def main():
         log_root = os.path.abspath(os.path.join('logs', 'np3o', runner_cfg['runner']['experiment_name']))
         ckpt = get_checkpoint_path(log_root, args_cli.load_run, args_cli.load_checkpoint)
     print(f'[INFO] loading checkpoint: {ckpt}')
-    runner.load(ckpt, load_optimizer=False)
+    _load_for_play(runner, ckpt)
 
     # Always export the JIT/ONNX policy next to the checkpoint (matches the
     # pre-NP3O scripts/rsl_rl/play.py behavior). Skip on --export_policy off

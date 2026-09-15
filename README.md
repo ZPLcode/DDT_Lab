@@ -123,8 +123,8 @@ python scripts/np3o/train.py --task=DDT-Velocity-Rough-D1-v0 \
     --num_envs 4096 --headless
 
 # D1 — spin up on four wheels, then lift FR/RL and spin on FL/RR (flat ground)
-# Yaw curriculum: 0.5 -> 1.0 -> 1.5 -> 2.0 (three stages) -> 2.5 -> 3.0 rad/s.
-# A level advances only after stable tracking; diagonal lift activates near 2 rad/s.
+# First-stage curriculum: 0.5 -> 1.0 -> 1.5 -> 2.0 rad/s, then hold at 2.0
+# while learning the diagonal lift. Each lift episode gets 2 s of spin-up.
 python scripts/np3o/train.py --task=DDT-Diagonal-Spin-Flat-D1-v0 \
     --num_envs 4096 --headless
 
