@@ -12,7 +12,9 @@ Adapted to read a flat dict cfg (the reference reads ``train_cfg['runner' /
 """
 
 import os
+import pathlib
 import statistics
+import subprocess
 import sys
 import time
 from collections import deque
@@ -21,7 +23,6 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import rsl_rl
-from rsl_rl.utils import store_code_state
 
 from .actor_critic import ActorCriticBarlowTwins
 from .np3o import NP3O
@@ -31,6 +32,52 @@ def _console_write(msg: str) -> None:
     """Write to the *real* stdout so Isaac Sim's carb logger can't swallow it."""
     sys.__stdout__.write(msg + "\n")
     sys.__stdout__.flush()
+
+
+def _store_code_state(log_dir: str, repository_file_paths: list[str]) -> None:
+    """Store git status/diff without relying on rsl_rl 2.x utilities.
+
+    rsl_rl 3.3 moved this behavior into its ``Logger`` class. This custom NP3O
+    runner owns its TensorBoard lifecycle, so using a small local equivalent
+    avoids constructing a second logger or calling the new private method.
+    """
+    git_log_dir = pathlib.Path(log_dir) / "git"
+    git_log_dir.mkdir(parents=True, exist_ok=True)
+
+    for repository_file_path in repository_file_paths:
+        source_path = pathlib.Path(repository_file_path).resolve()
+        search_dir = source_path if source_path.is_dir() else source_path.parent
+        try:
+            repo_root_result = subprocess.run(
+                ["git", "-C", str(search_dir), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            repo_root = pathlib.Path(repo_root_result.stdout.strip())
+            status = subprocess.run(
+                ["git", "-C", str(repo_root), "status", "--short"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            diff = subprocess.run(
+                ["git", "-C", str(repo_root), "diff", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            _console_write(f"Could not snapshot git repository for {source_path}. Skipping.")
+            continue
+
+        diff_path = git_log_dir / f"{repo_root.name}.diff"
+        if diff_path.exists():
+            continue
+        diff_path.write_text(
+            f"--- git status --short ---\n{status}\n\n--- git diff HEAD ---\n{diff}",
+            encoding="utf-8",
+        )
 
 
 def _short_episode_key(key: str) -> str:
@@ -95,7 +142,7 @@ class OnConstraintPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
 
-        # repos to snapshot via ``store_code_state`` at the start of learn().
+        # Repositories to snapshot at the start of learn().
         # Always include vendored rsl_rl; train script appends its own __file__.
         self.git_status_repos = [rsl_rl.__file__]
 
@@ -112,7 +159,7 @@ class OnConstraintPolicyRunner:
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             # snapshot git status / diff for every registered repo
-            store_code_state(self.log_dir, self.git_status_repos)
+            _store_code_state(self.log_dir, self.git_status_repos)
 
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(

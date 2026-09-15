@@ -723,3 +723,167 @@ def hip_pos(
     reward = flag * torch.sum(torch.square(q - q_default), dim=1)
     reward *= torch.clamp(-asset.data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return torch.sum(torch.square(q - q_default), dim=1)
+
+
+# -----------------------------------------------------------------------------
+# Diagonal two-wheel spin rewards
+# -----------------------------------------------------------------------------
+#
+# Most locomotion rewards in this module intentionally fade out when the robot
+# is no longer upright (projected_gravity_b[..., 2] approaches zero).  That is
+# useful for ordinary locomotion, but the task-specific terms below need direct
+# control over their orientation and spin-speed gates.  They therefore avoid
+# the generic upright gate and apply the requested gates explicitly.
+
+
+def projected_gravity_target_l2(
+    env: ManagerBasedRLEnv,
+    target_gravity: tuple[float, float, float],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize deviation from a target projected-gravity vector."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    target = asset.data.projected_gravity_b.new_tensor(target_gravity)
+    return torch.sum(torch.square(asset.data.projected_gravity_b - target), dim=1)
+
+
+def _gravity_target_gate(
+    asset: RigidObject,
+    target_gravity: tuple[float, float, float],
+    gate_std: float,
+) -> torch.Tensor:
+    """Return a smooth gate in [0, 1] for proximity to a target orientation."""
+    target = asset.data.projected_gravity_b.new_tensor(target_gravity)
+    orientation_error = torch.sum(
+        torch.square(asset.data.projected_gravity_b - target), dim=1
+    )
+    return torch.exp(-orientation_error / gate_std**2)
+
+
+def track_lin_vel_xy_yaw_frame_exp_at_gravity_target(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    target_gravity: tuple[float, float, float],
+    gate_std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track yaw-frame planar velocity near the requested target orientation."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    vel_yaw = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )
+    velocity_error = torch.sum(
+        torch.square(
+            env.command_manager.get_command(command_name)[:, :2] - vel_yaw[:, :2]
+        ),
+        dim=1,
+    )
+    return torch.exp(-velocity_error / std**2) * _gravity_target_gate(
+        asset, target_gravity, gate_std
+    )
+
+
+def selected_body_contact_count(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Count selected bodies whose contact force exceeds ``threshold``."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    is_contact = torch.max(torch.norm(forces, dim=-1), dim=1).values > threshold
+    return torch.sum(is_contact, dim=1).float()
+
+
+def selected_body_height_exp(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward selected bodies for reaching a target world-frame height."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    height_error = torch.sum(
+        torch.square(asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - target_height), dim=1
+    )
+    return torch.exp(-height_error / std**2)
+
+
+def _min_ang_vel_z_gate(
+    env: ManagerBasedRLEnv,
+    min_ang_vel_z: float,
+    transition_width: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Smoothly activate a term once the absolute world yaw rate is high enough."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    return torch.sigmoid(
+        (torch.abs(asset.data.root_ang_vel_w[:, 2]) - min_ang_vel_z) / transition_width
+    )
+
+
+def selected_body_height_exp_at_min_ang_vel_z(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    std: float,
+    min_ang_vel_z: float,
+    transition_width: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward selected-body height only after the robot has built yaw speed."""
+    return selected_body_height_exp(env, target_height, std, asset_cfg) * _min_ang_vel_z_gate(
+        env, min_ang_vel_z, transition_width
+    )
+
+
+def selected_bodies_air_with_support_at_min_ang_vel_z(
+    env: ManagerBasedRLEnv,
+    air_sensor_cfg: SceneEntityCfg,
+    support_sensor_cfg: SceneEntityCfg,
+    min_ang_vel_z: float,
+    transition_width: float,
+    min_air_time: float = 0.02,
+    contact_threshold: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Continuously reward the requested air pair while both supports touch."""
+    air_sensor: ContactSensor = env.scene.sensors[air_sensor_cfg.name]
+    support_sensor: ContactSensor = env.scene.sensors[support_sensor_cfg.name]
+
+    air_time = air_sensor.data.current_air_time[:, air_sensor_cfg.body_ids]
+    all_air = torch.all(air_time > min_air_time, dim=1)
+
+    support_forces = support_sensor.data.net_forces_w_history[
+        :, :, support_sensor_cfg.body_ids, :
+    ]
+    support_contacts = (
+        torch.max(torch.norm(support_forces, dim=-1), dim=1).values
+        > contact_threshold
+    )
+    all_support = torch.all(support_contacts, dim=1)
+
+    return (all_air & all_support).float() * _min_ang_vel_z_gate(
+        env, min_ang_vel_z, transition_width, asset_cfg
+    )
+
+
+def selected_body_contact_count_by_ang_vel_z_phase(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    min_ang_vel_z: float,
+    transition_width: float,
+    threshold: float = 1.0,
+    low_speed_scale: float = 1.0,
+    high_speed_scale: float = -2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward selected contacts at low yaw speed and penalize them at high speed."""
+    gate = _min_ang_vel_z_gate(env, min_ang_vel_z, transition_width, asset_cfg)
+    scale = low_speed_scale * (1.0 - gate) + high_speed_scale * gate
+    return selected_body_contact_count(env, sensor_cfg, threshold) * scale
+
+
+def action_rate_l2_no_upright(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize action changes without applying the locomotion upright gate."""
+    return torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)

@@ -30,3 +30,11 @@ def d1_rough_np3o_runner_cfg() -> dict:
     cfg["runner"]["experiment_name"] = "d1_rough"
     cfg["runner"]["max_iterations"] = 20000
     return cfg
+
+
+def d1_diagonal_spin_np3o_runner_cfg() -> dict:
+    """D1 four-wheel-to-FL/RR diagonal high-speed spin training config."""
+    cfg = base_np3o_runner_cfg()
+    cfg["runner"]["experiment_name"] = "d1_diagonal_spin"
+    cfg["runner"]["max_iterations"] = 10000
+    return cfg

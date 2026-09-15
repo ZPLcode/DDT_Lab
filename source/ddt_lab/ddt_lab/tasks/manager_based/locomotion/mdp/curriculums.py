@@ -53,3 +53,67 @@ def terrain_levels_vel(
     terrain.update_env_origins(env_ids, move_up, move_down)
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
+
+
+def diagonal_spin_yaw_speed_levels(
+    env: RLTaskEnv,
+    env_ids: Sequence[int],
+    reward_term_name: str,
+    command_name: str = "base_velocity",
+    levels: Sequence[float] = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0),
+    tracking_threshold: float = 0.7,
+    required_success_rate: float = 0.6,
+    evaluation_episodes: int = 4096,
+) -> dict[str, float]:
+    """Raise the fixed yaw command after stable tracking at the current level.
+
+    A completed episode is successful when its time-normalized yaw-tracking
+    reward reaches ``tracking_threshold`` of the term's maximum. Early
+    termination therefore counts against progression. After advancing, one
+    episode duration is left as a cooldown so every environment can receive
+    the new command before the next level is evaluated.
+    """
+    if not levels:
+        raise ValueError("Yaw-speed curriculum requires at least one level.")
+
+    command_cfg = env.command_manager.get_term(command_name).cfg
+
+    if not hasattr(env, "_diagonal_spin_curriculum_level"):
+        env._diagonal_spin_curriculum_level = 0
+        env._diagonal_spin_curriculum_successes = 0
+        env._diagonal_spin_curriculum_episodes = 0
+        env._diagonal_spin_curriculum_success_rate = 0.0
+        env._diagonal_spin_curriculum_level_step = env.common_step_counter
+    elif env.common_step_counter - env._diagonal_spin_curriculum_level_step >= env.max_episode_length:
+        episode_sums = env.reward_manager._episode_sums[reward_term_name][env_ids]
+        reward_weight = env.reward_manager.get_term_cfg(reward_term_name).weight
+        normalized_tracking = episode_sums / (env.max_episode_length_s * reward_weight)
+
+        env._diagonal_spin_curriculum_successes += int(
+            torch.count_nonzero(normalized_tracking >= tracking_threshold).item()
+        )
+        env._diagonal_spin_curriculum_episodes += int(normalized_tracking.numel())
+
+        if env._diagonal_spin_curriculum_episodes >= evaluation_episodes:
+            success_rate = (
+                env._diagonal_spin_curriculum_successes
+                / env._diagonal_spin_curriculum_episodes
+            )
+            env._diagonal_spin_curriculum_success_rate = success_rate
+            if (
+                success_rate >= required_success_rate
+                and env._diagonal_spin_curriculum_level < len(levels) - 1
+            ):
+                env._diagonal_spin_curriculum_level += 1
+                env._diagonal_spin_curriculum_level_step = env.common_step_counter
+
+            env._diagonal_spin_curriculum_successes = 0
+            env._diagonal_spin_curriculum_episodes = 0
+
+    yaw_command = float(levels[env._diagonal_spin_curriculum_level])
+    command_cfg.ranges.ang_vel_z = (yaw_command, yaw_command)
+    return {
+        "level": float(env._diagonal_spin_curriculum_level),
+        "yaw_command": yaw_command,
+        "success_rate": float(env._diagonal_spin_curriculum_success_rate),
+    }

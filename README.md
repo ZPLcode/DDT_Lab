@@ -86,7 +86,7 @@ python -m pip install -e source/ddt_lab
 ### 5. Verify installation
 
 ```bash
-# Should print 8 DDT-* tasks
+# Should print 10 DDT-* tasks
 python scripts/list_envs.py
 ```
 
@@ -100,6 +100,8 @@ Expected output:
 | DDT-Velocity-Flat-D1-Play-v0     | D1FlatEnvCfg_PLAY               |
 | DDT-Velocity-Rough-D1-v0         | D1RoughEnvCfg                   |
 | DDT-Velocity-Rough-D1-Play-v0    | D1RoughEnvCfg_PLAY              |
+| DDT-Diagonal-Spin-Flat-D1-v0      | D1DiagonalSpinFlatEnvCfg        |
+| DDT-Diagonal-Spin-Flat-D1-Play-v0 | D1DiagonalSpinFlatEnvCfg_PLAY   |
 | DDT-Velocity-Flat-Tita-v0        | TitaFlatEnvCfg                  |
 | DDT-Velocity-Flat-Tita-Play-v0   | TitaFlatEnvCfg_PLAY             |
 | DDT-Velocity-Rough-Tita-v0       | TitaRoughEnvCfg                 |
@@ -118,6 +120,12 @@ python scripts/np3o/train.py --task=DDT-Velocity-Flat-D1-v0 \
 
 # D1 — rough terrain (trimesh, terrain curriculum)
 python scripts/np3o/train.py --task=DDT-Velocity-Rough-D1-v0 \
+    --num_envs 4096 --headless
+
+# D1 — spin up on four wheels, then lift FR/RL and spin on FL/RR (flat ground)
+# Yaw curriculum: 0.5 -> 1.0 -> 1.5 -> 2.0 (three stages) -> 2.5 -> 3.0 rad/s.
+# A level advances only after stable tracking; diagonal lift activates near 2 rad/s.
+python scripts/np3o/train.py --task=DDT-Diagonal-Spin-Flat-D1-v0 \
     --num_envs 4096 --headless
 
 # Tita — flat ground
